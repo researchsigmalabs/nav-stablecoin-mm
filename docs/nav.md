@@ -65,6 +65,19 @@ against them at a pinned block for an independent check.
 A wrong NAV mis-prices every share, so this guard is mandatory. The comparison is integer-only (no
 float rounding).
 
+## Price manipulation
+
+The NAV is marked at the pool's **spot** price (`slot0.sqrtPriceX96`), which an attacker can move
+within a single block. On a deep 1bp stablecoin pool this is costly and self-correcting, but the
+keeper does not rely on that alone. Before each submission it:
+
+1. reads a **TWAP** from `pool.observe(...)` over a sensible window and calls `pool_price_is_undisturbed(spot, twap, max_bps)`, rejecting the snapshot when spot deviates from the TWAP by more than a few basis points;
+2. sets a **tight** `max_jump_pct` on `nav_is_sane` (a stablecoin NAV should barely move between settles);
+3. relies on the **on-chain Lagoon guardrail** (`updateGuardrails`) as the final bound on how far the submitted NAV may move per settle.
+
+Marking at the pool price is deliberate — it reflects a real USDT depeg instead of masking it — so the
+defense is to guard the *price the mark uses*, not to switch to an off-pool oracle.
+
 ## On-chain submission
 
 This repository is **only the math**. On-chain, the vault's valuation-provider role (Admin Safe

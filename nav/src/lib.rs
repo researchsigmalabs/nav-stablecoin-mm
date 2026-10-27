@@ -278,9 +278,42 @@ pub fn compute_nav(s: &InventorySnapshot) -> U256 {
     nav0 + token1_in_token0(nav1, s.pool.sqrt_price_x96)
 }
 
+/// Rejects a snapshot whose pool **spot** price has been pushed away from a reference TWAP by more
+/// than `max_bps` (in price terms). `compute_nav` marks the inventory to the spot price, which an
+/// attacker can move within a single block; the keeper reads a TWAP from `pool.observe(...)` over a
+/// sensible window and calls this guard **before** submitting, so a one-block price push cannot
+/// inflate the NAV. Pure: both prices are inputs; the comparison is integer-only.
+///
+/// For a stablecoin pair the band is tight (a few bps). This guard and a tight `max_jump_pct` on
+/// [`nav_is_sane`] are the keeper-side defenses; the on-chain Lagoon guardrail is the final bound.
+pub fn pool_price_is_undisturbed(
+    spot_sqrt_price_x96: U256,
+    twap_sqrt_price_x96: U256,
+    max_bps: u64,
+) -> eyre::Result<()> {
+    // Compare in price (= sqrtPrice^2) terms: |spot^2 - twap^2| / twap^2 <= max_bps / 10_000.
+    let spot2 = widen(spot_sqrt_price_x96) * widen(spot_sqrt_price_x96);
+    let twap2 = widen(twap_sqrt_price_x96) * widen(twap_sqrt_price_x96);
+    if twap2.is_zero() {
+        eyre::bail!("TWAP price is zero");
+    }
+    let (hi, lo) = if spot2 >= twap2 {
+        (spot2, twap2)
+    } else {
+        (twap2, spot2)
+    };
+    let diff = hi - lo;
+    if diff * U512::from(10_000u64) > twap2 * U512::from(max_bps) {
+        eyre::bail!("pool spot price deviates from TWAP by more than {max_bps} bps");
+    }
+    Ok(())
+}
+
 /// Mandatory guard before pushing a NAV. A wrong NAV mis-prices every share, so we reject a zero NAV
 /// while shares exist, and any move larger than `max_jump_pct` versus the previous on-chain
-/// `totalAssets`. Integer-only: no float rounding in the comparison.
+/// `totalAssets`. Integer-only: no float rounding in the comparison. On a stablecoin vault
+/// `max_jump_pct` is set tight (a few percent), and [`pool_price_is_undisturbed`] guards the spot
+/// price the NAV is marked at.
 pub fn nav_is_sane(
     nav: U256,
     prev_total_assets: U256,
@@ -458,5 +491,20 @@ mod tests {
     #[test]
     fn guard_accepts_first_valuation() {
         assert!(nav_is_sane(U256::from(123u64), U256::ZERO, U256::ZERO, 25.0).is_ok());
+    }
+
+    // ── the spot-vs-TWAP price guard ──
+    #[test]
+    fn price_guard_accepts_an_undisturbed_price() {
+        let p = u("88479733489685521798680766203");
+        assert!(pool_price_is_undisturbed(p, p, 50).is_ok());
+    }
+
+    #[test]
+    fn price_guard_rejects_a_single_block_push() {
+        let twap = q96(); // price 1
+        let spot = get_sqrt_ratio_at_tick(200); // price ≈ +2.02% (≈ 202 bps)
+        assert!(pool_price_is_undisturbed(spot, twap, 50).is_err()); // outside a 50 bps band
+        assert!(pool_price_is_undisturbed(spot, twap, 500).is_ok()); // inside a 500 bps band
     }
 }
